@@ -1,7 +1,12 @@
 {
   "name": "ifcastle/aql-sqldriver",
   "description": "Abstract SQL driver base class for AQL storage adapters",
-  "keywords": ["aql", "sql", "driver", "database"],
+  "keywords": [
+    "aql",
+    "sql",
+    "driver",
+    "database"
+  ],
   "type": "ifcastle-aql-package",
   "license": "MIT",
   "authors": [
@@ -33,9 +38,14 @@
   },
   "require-dev": {
     "phpunit/phpunit": "^11.2",
-    "rector/rector": "^1.2"
+    "rector/rector": "^1.2",
+    "ifcastle/codestyle": "^0.0.2"
   },
   "scripts": {
-    "test": "vendor/bin/phpunit ./tests"
+    "test": "vendor/bin/phpunit ./tests",
+    "cs-fix": "php-cs-fixer fix",
+    "cs-check": "php-cs-fixer fix --dry-run --diff",
+    "rector": "rector process",
+    "rector-dry": "rector process --dry-run"
   }
 }
