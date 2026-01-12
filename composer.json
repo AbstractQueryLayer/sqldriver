@@ -47,5 +47,10 @@
     "cs-check": "php-cs-fixer fix --dry-run --diff",
     "rector": "rector process",
     "rector-dry": "rector process --dry-run"
+  },
+  "extra": {
+    "branch-alias": {
+      "dev-main": "0.8.x-dev"
+    }
   }
 }
