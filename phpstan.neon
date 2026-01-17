@@ -1,0 +1,8 @@
+parameters:
+	level: 6
+	paths:
+		- src
+	tips:
+		treatPhpDocTypesAsCertain: false
+	ignoreErrors:
+		- identifier: identical.alwaysFalse

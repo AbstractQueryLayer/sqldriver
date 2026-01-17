@@ -17,13 +17,13 @@
   ],
   "require": {
     "php": ">=8.4",
-    "ifcastle/aql-dsl": "^0.1.0",
-    "ifcastle/aql-entity": "^0.1.0",
-    "ifcastle/aql-executor": "^0.1.0",
-    "ifcastle/aql-generator": "^0.1.0",
-    "ifcastle/aql-result": "^0.1.0",
-    "ifcastle/aql-storage": "^0.1.0",
-    "ifcastle/aql-transaction": "^0.1.0",
+    "ifcastle/aql-dsl": "*",
+    "ifcastle/aql-entity": "*",
+    "ifcastle/aql-executor": "*",
+    "ifcastle/aql-generator": "*",
+    "ifcastle/aql-result": "*",
+    "ifcastle/aql-storage": "*",
+    "ifcastle/aql-transaction": "*",
     "ifcastle/di": "^0.6.0"
   },
   "autoload": {
