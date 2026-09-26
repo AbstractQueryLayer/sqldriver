@@ -22,7 +22,6 @@ use IfCastle\AQL\Storage\Exceptions\QueryException;
 use IfCastle\AQL\Storage\Exceptions\RecoverableException;
 use IfCastle\AQL\Storage\Exceptions\ServerHasGoneAwayException;
 use IfCastle\AQL\Storage\Exceptions\StorageException;
-use IfCastle\AQL\Storage\Exceptions\TransactionResumeException;
 use IfCastle\AQL\Storage\QueryableTelemetryInterface;
 use IfCastle\AQL\Storage\SqlStatementFactoryInterface;
 use IfCastle\AQL\Storage\SqlStatementInterface;
@@ -64,9 +63,10 @@ abstract class SqlDriverAbstract implements
 
     protected int $maxAttempts          = 3;
 
+    /**
+     * The innermost transaction begun here and not finished yet.
+     */
     protected ?TransactionInterface $transaction = null;
-
-    protected array $transactionStack   = [];
 
     protected ?StorageException $lastError = null;
 
@@ -164,8 +164,8 @@ abstract class SqlDriverAbstract implements
 
         $transaction                = $context instanceof TransactionAwareInterface ? $context->getTransaction() : null;
 
-        if ($transaction !== null && false === $transaction->isTransactionOpened($this->getStorageName())) {
-            $this->beginTransaction($transaction);
+        if ($transaction !== null) {
+            $this->joinTransaction($transaction);
         }
 
         return $this->realExecuteQuery($sql);
@@ -194,8 +194,8 @@ abstract class SqlDriverAbstract implements
 
         $transaction                = $context instanceof TransactionAwareInterface ? $context->getTransaction() : null;
 
-        if ($transaction !== null && false === $transaction->isTransactionOpened($this->getStorageName())) {
-            $this->beginTransaction($transaction);
+        if ($transaction !== null) {
+            $this->joinTransaction($transaction);
         }
 
 
@@ -204,7 +204,16 @@ abstract class SqlDriverAbstract implements
     }
 
     /**
+     * Begins the transaction on this storage. A transaction with a parent becomes a savepoint in the
+     * parent's transaction, and the parent begins here first if it has not yet; a transaction without a
+     * parent begins a transaction of the connection. It commits or rolls back the storage when it finishes.
+     * A savepoint rollback undoes everything the connection did since the savepoint, the parent's
+     * statements included: a parent's statements run while a child is open belong to the child.
+     *
      * @throws ConnectFailed
+     * @throws StorageException when the parent is open here but the connection of this coroutine has no
+     *                          transaction, or when a transaction without a parent begins inside an open one
+     * @throws \LogicException when the transaction has finished or is already open on this storage
      */
     #[\Override]
     public function beginTransaction(TransactionInterface $transaction): void
@@ -213,23 +222,66 @@ abstract class SqlDriverAbstract implements
             $this->connect();
         }
 
-        if ($this->transaction !== null && $transaction->getParentTransaction() === null) {
-            $transaction->setParentTransaction(
-                $transaction
-            );
+        $key                        = $this->transactionKey();
+        $parent                     = $transaction->getParentTransaction();
+        $savepoint                  = null;
+
+        if ($parent !== null && false === $parent->isTransactionOpened($key)) {
+            $this->beginTransaction($parent);
         }
 
-        $this->transactionStack[]   = $transaction;
+        if ($parent !== null) {
+            // A SAVEPOINT outside a transaction succeeds and creates nothing: the rows would commit at once.
+            if (false === $this->realInTransaction()) {
+                throw new QueryException('The parent transaction is not open on the connection of this coroutine', 'SAVEPOINT');
+            }
+
+            $savepoint              = 'aql_' . \spl_object_id($transaction);
+        }
+
+        //
+        // See: https://dev.mysql.com/doc/refman/9.0/en/savepoint.html
+        //
+        if ($savepoint === null) {
+            $this->realBeginTransaction($transaction);
+        } else {
+            $this->realExecuteQuery('SAVEPOINT ' . $savepoint);
+        }
+
+        // Registered after the begin, so that a begin the server refused leaves nothing to finish.
+        try {
+            $transaction->openTransaction(
+                $key,
+                fn(bool $commit) => $this->finalizeTransaction($commit, $transaction, $parent, $savepoint)
+            );
+        } catch (\LogicException $exception) {
+            $this->finalizeTransaction(false, $transaction, $parent, $savepoint);
+            throw $exception;
+        }
+
         $this->transaction          = $transaction;
+    }
 
-        $transaction->openTransaction($this->getStorageName(), $this->finalizeTransaction(...));
+    /**
+     * Makes the next statement run inside the transaction: begins it here, or checks that the server has
+     * not ended it. A deadlock or an implicit commit ends it on the server, and a statement run after that
+     * would commit on its own.
+     *
+     * @throws StorageException when the connection of this coroutine is no longer in a transaction
+     */
+    protected function joinTransaction(TransactionInterface $transaction): void
+    {
+        if (false === $transaction->isTransactionOpened($this->transactionKey())) {
+            $this->beginTransaction($transaction);
+            return;
+        }
 
-        $this->realBeginTransaction($transaction);
+        if (false === $this->realInTransaction()) {
+            throw new QueryException('The transaction is no longer open on the connection of this coroutine', '');
+        }
     }
 
     abstract protected function isDisconnected(): bool;
-
-    abstract protected function realBeginTransaction(TransactionInterface $transaction): void;
 
     #[\Override]
     public function getTransaction(): ?TransactionInterface
@@ -353,65 +405,50 @@ abstract class SqlDriverAbstract implements
         $this->disconnect();
     }
 
-    protected function finalizeTransaction(bool $status, TransactionInterface $transaction): void
+    /**
+     * The key a transaction registers this storage under: its name, or its identity when it has none.
+     */
+    protected function transactionKey(): string
     {
-        if ($this->transaction !== $transaction) {
-            return;
-        }
-
-        if ($this->transactionStack !== [] && false === $this->isNestedTransactionsSupported()) {
-
-            if ($status) {
-                $this->transaction  = \array_pop($this->transactionStack);
-                return;
-            }
-
-            // If nested transactions not supported, then we must rollback all transactions
-            $this->transaction  = null;
-            $exception          = null;
-
-            try {
-                while ($this->transactionStack !== []) {
-                    $transaction    = \array_pop($this->transactionStack);
-                    $transaction->rollBack();
-                }
-            } catch (TransactionResumeException) {
-
-                // Special case, when the transaction was resumed
-                // So we restore the last transaction and continue.
-                $this->transaction  = $transaction;
-
-                return;
-
-            } catch (\Throwable $exception) {
-
-            }
-
-            $this->realRollback($transaction);
-
-            if ($exception !== null) {
-                throw $exception;
-            }
-
-            return;
-        }
-
-        if ($this->transactionStack !== []) {
-            $this->transaction      = \array_pop($this->transactionStack);
-        }
-
-        if ($status) {
-            $this->realCommit($transaction);
-        } else {
-            $this->realRollback($transaction);
-        }
+        return $this->storageName ?? static::class . '#' . \spl_object_id($this);
     }
 
-    abstract protected function realCommit(TransactionInterface $transaction): void;
+    /**
+     * Ends on the server what beginTransaction() began: the connection's transaction, or the savepoint.
+     */
+    protected function finalizeTransaction(
+        bool $commit,
+        TransactionInterface $transaction,
+        ?TransactionInterface $parent,
+        ?string $savepoint
+    ): void {
+        if ($savepoint === null) {
+            $this->transaction      = null;
+        } elseif ($this->transaction === $transaction) {
+            $this->transaction      = $parent;
+        }
 
-    abstract protected function realRollback(TransactionInterface $transaction): void;
+        match (true) {
+            $savepoint === null && $commit => $this->realCommit(),
+            $savepoint === null     => $this->realRollback(),
+            $commit                 => $this->realExecuteQuery('RELEASE SAVEPOINT ' . $savepoint),
+            default                 => $this->realExecuteQuery('ROLLBACK TO SAVEPOINT ' . $savepoint),
+        };
+    }
+
+    /**
+     * Begins a transaction of the connection, at the isolation level of the given one when it names a level.
+     */
+    abstract protected function realBeginTransaction(TransactionInterface $transaction): void;
+
+    abstract protected function realCommit(): void;
+
+    /**
+     * Whether the connection of this coroutine is inside a transaction, as the server reports it.
+     */
+    abstract protected function realInTransaction(): bool;
+
+    abstract protected function realRollback(): void;
 
     abstract protected function normalizeException(\Throwable $exception, string $sql): StorageException;
-
-    abstract protected function isNestedTransactionsSupported(): bool;
 }
