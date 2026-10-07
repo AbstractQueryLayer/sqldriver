@@ -64,9 +64,11 @@ abstract class SqlDriverAbstract implements
     protected int $maxAttempts          = 3;
 
     /**
-     * The innermost transaction begun here and not finished yet.
+     * The transactions open on the connection, for a driver whose coroutines share one connection.
      */
-    protected ?TransactionInterface $transaction = null;
+    private ?OpenTransactions $openTransactions = null;
+
+    private ?ContainerInterface $container = null;
 
     protected ?StorageException $lastError = null;
 
@@ -107,6 +109,7 @@ abstract class SqlDriverAbstract implements
     #[\Override]
     public function resolveDependencies(ContainerInterface $container): void
     {
+        $this->container            = $container;
         $this->telemetry             = $container->findDependency(ConnectableTelemetryInterface::class);
         $this->queryTelemetry        = $container->findDependency(QueryableTelemetryInterface::class);
     }
@@ -158,6 +161,7 @@ abstract class SqlDriverAbstract implements
     #[\Override]
     public function executeSql(string $sql, ?object $context = null): ResultInterface
     {
+        $this->openTransactions()->checkUsable();
         if ($this->isDisconnected()) {
             $this->connect();
         }
@@ -168,7 +172,12 @@ abstract class SqlDriverAbstract implements
             $this->joinTransaction($transaction);
         }
 
-        return $this->realExecuteQuery($sql);
+        try {
+            return $this->realExecuteQuery($sql);
+        } catch (StorageException $exception) {
+            $this->noteFailure($exception);
+            throw $exception;
+        }
     }
 
     abstract protected function realCreateStatement(string $sql): SqlStatementInterface;
@@ -176,6 +185,7 @@ abstract class SqlDriverAbstract implements
     #[\Override]
     public function createStatement(string $sql, ?object $context = null): SqlStatementInterface
     {
+        $this->openTransactions()->checkUsable();
         if ($this->isDisconnected()) {
             $this->connect();
         }
@@ -188,6 +198,7 @@ abstract class SqlDriverAbstract implements
     #[\Override]
     public function executeStatement(SqlStatementInterface $statement, array $params = [], ?object $context = null): ResultInterface
     {
+        $this->openTransactions()->checkUsable();
         if ($this->isDisconnected()) {
             $this->connect();
         }
@@ -198,9 +209,23 @@ abstract class SqlDriverAbstract implements
             $this->joinTransaction($transaction);
         }
 
+        try {
+            return $this->realExecuteStatement($statement);
+        } catch (StorageException $exception) {
+            $this->noteFailure($exception);
+            throw $exception;
+        }
+    }
 
-
-        return $this->realExecuteStatement($statement);
+    /**
+     * Records a failure that made the server roll back the transaction of the connection. The driver of
+     * the connection still reports a transaction after such an error, so this record is what tells.
+     */
+    private function noteFailure(StorageException $exception): void
+    {
+        if ($this->endsTransaction($exception)) {
+            $this->openTransactions()->markEndedByServer();
+        }
     }
 
     /**
@@ -211,33 +236,34 @@ abstract class SqlDriverAbstract implements
      * statements included: a parent's statements run while a child is open belong to the child.
      *
      * @throws ConnectFailed
-     * @throws StorageException when the parent is open here but the connection of this coroutine has no
-     *                          transaction, or when a transaction without a parent begins inside an open one
+     * @throws StorageException when the parent is open on the connection of another coroutine or is no longer
+     *                          open on the server, or when a transaction without a parent begins inside an
+     *                          open one
      * @throws \LogicException when the transaction has finished or is already open on this storage
      */
     #[\Override]
     public function beginTransaction(TransactionInterface $transaction): void
     {
+        $this->openTransactions()->checkUsable();
         if ($this->isDisconnected()) {
             $this->connect();
         }
 
         $key                        = $this->transactionKey();
+
+        if ($transaction->isTransactionOpened($key)) {
+            throw new \LogicException('The transaction is already open on this storage');
+        }
+
+        $open                       = $this->openTransactions();
         $parent                     = $transaction->getParentTransaction();
-        $savepoint                  = null;
 
         if ($parent !== null && false === $parent->isTransactionOpened($key)) {
             $this->beginTransaction($parent);
         }
 
-        if ($parent !== null) {
-            // A SAVEPOINT outside a transaction succeeds and creates nothing: the rows would commit at once.
-            if (false === $this->realInTransaction()) {
-                throw new QueryException('The parent transaction is not open on the connection of this coroutine', 'SAVEPOINT');
-            }
-
-            $savepoint              = 'aql_' . \spl_object_id($transaction);
-        }
+        $this->checkBeginsOn($open, $parent);
+        $savepoint                  = $parent === null ? null : 'aql_' . \spl_object_id($transaction);
 
         //
         // See: https://dev.mysql.com/doc/refman/9.0/en/savepoint.html
@@ -248,18 +274,42 @@ abstract class SqlDriverAbstract implements
             $this->realExecuteQuery('SAVEPOINT ' . $savepoint);
         }
 
+        $open->add($transaction);
+
         // Registered after the begin, so that a begin the server refused leaves nothing to finish.
         try {
             $transaction->openTransaction(
                 $key,
-                fn(bool $commit) => $this->finalizeTransaction($commit, $transaction, $parent, $savepoint)
+                fn(bool $commit) => $this->finalizeTransaction($commit, $open, $transaction, $savepoint),
+                fn() => $this->checkFinishesOn($open)
             );
         } catch (\LogicException $exception) {
-            $this->finalizeTransaction(false, $transaction, $parent, $savepoint);
+            $this->finalizeTransaction(false, $open, $transaction, $savepoint);
             throw $exception;
         }
+    }
 
-        $this->transaction          = $transaction;
+    /**
+     * @throws StorageException when the transaction cannot begin on the connection of this coroutine
+     */
+    private function checkBeginsOn(OpenTransactions $open, ?TransactionInterface $parent): void
+    {
+        if ($parent === null) {
+            if (false === $open->isEmpty()) {
+                throw new QueryException('A transaction without a parent cannot begin inside an open one', 'BEGIN');
+            }
+
+            return;
+        }
+
+        if (false === $open->contains($parent)) {
+            throw new QueryException('The parent transaction is open on the connection of another coroutine', 'SAVEPOINT');
+        }
+
+        // A SAVEPOINT outside a transaction succeeds and creates nothing: the rows would commit at once.
+        if ($open->isEndedByServer() || false === $this->realInTransaction()) {
+            throw new QueryException('The parent transaction is no longer open on the server', 'SAVEPOINT');
+        }
     }
 
     /**
@@ -267,7 +317,8 @@ abstract class SqlDriverAbstract implements
      * not ended it. A deadlock or an implicit commit ends it on the server, and a statement run after that
      * would commit on its own.
      *
-     * @throws StorageException when the connection of this coroutine is no longer in a transaction
+     * @throws StorageException when the transaction is open on the connection of another coroutine, or the
+     *                          connection of this coroutine is no longer in a transaction
      */
     protected function joinTransaction(TransactionInterface $transaction): void
     {
@@ -276,17 +327,30 @@ abstract class SqlDriverAbstract implements
             return;
         }
 
-        if (false === $this->realInTransaction()) {
+        $open                       = $this->openTransactions();
+
+        if ($open->endedWith($transaction) !== null) {
+            throw new QueryException('The savepoint has ended with an enclosing savepoint set before it', '');
+        }
+
+        if (false === $open->contains($transaction)) {
+            throw new QueryException('The transaction is open on the connection of another coroutine', '');
+        }
+
+        if ($open->isEndedByServer() || false === $this->realInTransaction()) {
             throw new QueryException('The transaction is no longer open on the connection of this coroutine', '');
         }
     }
 
     abstract protected function isDisconnected(): bool;
 
+    /**
+     * The innermost transaction open on the connection of this coroutine, or null.
+     */
     #[\Override]
     public function getTransaction(): ?TransactionInterface
     {
-        return $this->transaction;
+        return $this->openTransactions()->innermost();
     }
 
     /**
@@ -380,7 +444,7 @@ abstract class SqlDriverAbstract implements
     #[\Override]
     public function resolveQueryExecutor(BasicQueryInterface $basicQuery, ?EntityInterface $entity = null): ?QueryExecutorInterface
     {
-        return match ($basicQuery->getQueryAction()) {
+        $executor = match ($basicQuery->getQueryAction()) {
             QueryInterface::ACTION_COPY,
             QueryInterface::ACTION_SELECT,
             QueryInterface::ACTION_COUNT,
@@ -391,6 +455,12 @@ abstract class SqlDriverAbstract implements
                                     => new SqlQueryExecutor(),
             default                 => null
         };
+
+        if ($executor !== null) {
+            $executor->resolveDependencies($this->container ?? throw new \LogicException('Resolve storage dependencies before AQL queries'));
+        }
+
+        return $executor;
     }
 
     #[\Override]
@@ -414,26 +484,153 @@ abstract class SqlDriverAbstract implements
     }
 
     /**
+     * The transactions open on the connection this coroutine uses. Here the driver has one connection for
+     * every coroutine; a driver that gives each coroutine a connection of its own keeps a list per coroutine.
+     */
+    protected function openTransactions(): OpenTransactions
+    {
+        return $this->openTransactions ??= new OpenTransactions();
+    }
+
+    /**
+     * @throws StorageException when the transaction belongs to another coroutine that is still running
+     */
+    private function checkFinishesOn(OpenTransactions $open): void
+    {
+        if ($open !== $this->openTransactions() && false === $open->isOwnerGone()) {
+            throw new QueryException('A transaction finishes in the coroutine that began it', '');
+        }
+
+        if (false === $open->isOwnerGone()) {
+            $open->checkUsable();
+        }
+    }
+
+    /**
      * Ends on the server what beginTransaction() began: the connection's transaction, or the savepoint.
+     * What already ended, with an enclosing savepoint, on the server, or with its coroutine, is not sent
+     * again: finishing it the way it ended succeeds, finishing it the other way fails.
+     *
+     * @throws StorageException when the server refuses the statement, or when what already ended is
+     *                          finished the other way
      */
     protected function finalizeTransaction(
         bool $commit,
+        OpenTransactions $open,
         TransactionInterface $transaction,
-        ?TransactionInterface $parent,
         ?string $savepoint
     ): void {
-        if ($savepoint === null) {
-            $this->transaction      = null;
-        } elseif ($this->transaction === $transaction) {
-            $this->transaction      = $parent;
+        if (false === $open->isOwnerGone()) {
+            $open->checkUsable();
         }
 
-        match (true) {
-            $savepoint === null && $commit => $this->realCommit(),
-            $savepoint === null     => $this->realRollback(),
-            $commit                 => $this->realExecuteQuery('RELEASE SAVEPOINT ' . $savepoint),
-            default                 => $this->realExecuteQuery('ROLLBACK TO SAVEPOINT ' . $savepoint),
-        };
+        try {
+            $this->finishOnConnection($commit, $open, $transaction, $savepoint);
+        } catch (\Throwable $exception) {
+            // Keep uncertain state local to this connection, without closing a shared pool.
+            if ($open->contains($transaction)) {
+                $open->markFinishFailed($exception);
+            }
+
+            throw $exception;
+        }
+    }
+
+    private function finishOnConnection(
+        bool $commit,
+        OpenTransactions $open,
+        TransactionInterface $transaction,
+        ?string $savepoint
+    ): void {
+        $enclosingReleased          = $open->endedWith($transaction);
+
+        if ($enclosingReleased !== null) {
+            if ($commit === $enclosingReleased) {
+                return;
+            }
+
+            throw new QueryException($commit
+                ? 'The savepoint was rolled back with an enclosing savepoint set before it'
+                : 'The savepoint was released with an enclosing savepoint set before it and cannot roll back alone',
+                $commit ? 'RELEASE SAVEPOINT' : 'ROLLBACK TO SAVEPOINT');
+        }
+
+        $endedByServer              = $open->isEndedByServer();
+        $ownerGone                  = $open !== $this->openTransactions();
+
+        if ($ownerGone) {
+            $open->removeFrom($transaction, false);
+            if ($commit) {
+                throw new QueryException('The coroutine that began the transaction has ended, and the pool rolled it back', 'COMMIT');
+            }
+
+            return;
+        }
+
+        if ($endedByServer) {
+            // PDO still reports the transaction of the connection after the error; a ROLLBACK clears that.
+            if ($savepoint === null || $commit) {
+                if ($this->realInTransaction()) {
+                    $this->realRollback();
+                }
+            }
+
+            $open->removeFrom($transaction, false);
+
+            if ($commit) {
+                throw new QueryException('The server rolled the transaction back', 'COMMIT');
+            }
+
+            return;
+        }
+
+        if (false === $commit) {
+            // A server that already ended the transaction has nothing left to roll back.
+            match (true) {
+                $savepoint !== null => $this->realExecuteQuery('ROLLBACK TO SAVEPOINT ' . $savepoint),
+                $this->realInTransaction() => $this->realRollback(),
+                default             => null,
+            };
+
+            $open->removeFrom($transaction, false);
+
+            return;
+        }
+
+        if ($savepoint !== null) {
+            $this->realExecuteQuery('RELEASE SAVEPOINT ' . $savepoint);
+            $open->removeFrom($transaction, true);
+            return;
+        }
+
+        try {
+            $this->realCommit();
+            $open->removeFrom($transaction, true);
+        } catch (\Throwable $exception) {
+            // The transaction is finished for its caller, so a COMMIT the server did not take would leave
+            // it open, and a pooled connection pinned, until the coroutine ends.
+            if ($this->rollBackQuietly()) {
+                $open->removeFrom($transaction, false);
+            }
+            throw $exception;
+        }
+    }
+
+    /**
+     * Rolls back a transaction still open on the server, for a caller that is already reporting an error.
+     */
+    private function rollBackQuietly(): bool
+    {
+        try {
+            if ($this->realInTransaction()) {
+                $this->realRollback();
+            }
+
+            return true;
+        } catch (\Throwable) {
+            // The connection is broken as well; the error of the caller says more than this one.
+            return false;
+        }
     }
 
     /**
@@ -444,9 +641,17 @@ abstract class SqlDriverAbstract implements
     abstract protected function realCommit(): void;
 
     /**
-     * Whether the connection of this coroutine is inside a transaction, as the server reports it.
+     * Whether the connection of this coroutine is inside a transaction, as the server last reported it.
      */
     abstract protected function realInTransaction(): bool;
+
+    /**
+     * Whether the server rolls back the transaction of the connection when a statement fails this way.
+     */
+    protected function endsTransaction(StorageException $exception): bool
+    {
+        return false;
+    }
 
     abstract protected function realRollback(): void;
 
